@@ -1,0 +1,3 @@
+nohup: ignoring input
+12/02/2024 19:50:04 - INFO - accelerate.utils.modeling - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s]Loading checkpoint shards:  33%|███▎      | 1/3 [00:00<00:01,  1.36it/s]Loading checkpoint shards:  67%|██████▋   | 2/3 [00:01<00:00,  1.36it/s]Loading checkpoint shards: 100%|██████████| 3/3 [00:01<00:00,  2.16it/s]Loading checkpoint shards: 100%|██████████| 3/3 [00:01<00:00,  1.87it/s]

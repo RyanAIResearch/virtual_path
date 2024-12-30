@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="JupyterPersistentConnectionParameters">
+    <option name="knownRemoteServers">
+      <list>
+        <JupyterConnectionParameters>
+          <option name="authType" value="notebook" />
+          <option name="token" value="49589dc5bdc60f2e7e47366ac2e7017c5dc403eff38451e4" />
+          <option name="urlString" value="http://localhost:8890" />
+          <authParams2>
+            <map>
+              <entry key="token" value="49589dc5bdc60f2e7e47366ac2e7017c5dc403eff38451e4" />
+            </map>
+          </authParams2>
+        </JupyterConnectionParameters>
+      </list>
+    </option>
+    <option name="moduleParameters">
+      <map>
+        <entry key="$PROJECT_DIR$/../../../Python/外包项目/计量经济学/.idea/计量经济学.iml">
+          <value>
+            <JupyterConnectionParameters>
+              <option name="managed" value="true" />
+            </JupyterConnectionParameters>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+</project>
