@@ -2,7 +2,7 @@ import json
 import matplotlib.pyplot as plt
 
 # 加载 JSON 文件
-with open("/home/yran1/FlZO_Vritual_Path/_gemma_2b_BoolQ_client2_global_step3.json", "r") as f1:
+with open("/home/yran1/FlZO_Vritual_Path/norm_gemma_2b_AGNews_client0_global_step0.json", "r") as f1:
     cosine_similarity_data = json.load(f1)
 
 # 过滤数据 (仅取 step <= 100)
@@ -29,5 +29,5 @@ plt.grid(True)
 # plt.yticks(range(min_y, max_y + 20, 20))
 
 # 保存图片到本地
-plt.savefig("_gemma_2b_BoolQ_client2_global_step3.png", dpi=300)  # 保存为 PNG 格式
+plt.savefig("norm_gemma_2b_AGNews_client0_global_step0.png", dpi=300)  # 保存为 PNG 格式
 plt.show()

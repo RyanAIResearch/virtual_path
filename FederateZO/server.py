@@ -221,7 +221,11 @@ class Server(object):
                 project_grad_accelerator = {}
                 # fill the dict
                 print("calculate each client inner product with c4 grad")
+                import ipdb
                 virtual_path = self.calculate_each_client_innerproduct(step, grad_accumulator)
+                optimzed_virtual_path = self.early_stopping_checker(virtual_path)
+                print("optimzed_virtual_path: ", optimzed_virtual_path)
+                ipdb.set_trace()
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 client_optim_parameters_dict = {}
                 client_model_dict = {}
@@ -279,7 +283,7 @@ class Server(object):
                 project_grad_accelerator = {}
                 # fill the dict
                 print("calculate each client inner product with c4 grad")
-                # self.calculate_each_client_innerproduct(step, grad_accumulator)
+                self.calculate_each_client_innerproduct(step, grad_accumulator)
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 client_optim_parameters_dict = {}
                 client_model_dict = {}
@@ -533,71 +537,58 @@ class Server(object):
             ctx_manager = contextlib.nullcontext()
 
         return ctx_manager
-    
-    def early_stopping_checker(self, current_global_step, each_client_project_grad_list, initial_step=0):
-        if self.args.training_mode == "sparse_dynamic_earlystppping":
-            for idx, client_training_trace in enumerate(each_client_project_grad_list):
-                self.dot_product = []
-                current_client_id = client_training_trace["client_id"]
-                client_optim_parameters_dict = {}
-                client_model_dict = {}
-                client_optim_parameters_dict[f"client_optim_parameter_{idx}"] = copy.deepcopy(self.named_parameters_to_optim)
-                client_model_dict[f"client_model_{idx}"] = copy.deepcopy(self.global_model)
-                server_monitor_client_optim_optimizer = torch.optim.SGD(list(client_optim_parameters_dict[f"client_optim_parameter_{idx}"].values()), lr=self.args.learning_rate, weight_decay=self.args.weight_decay)
-                server_monitor_client_optim_scheduler = transformers.get_constant_schedule(server_monitor_client_optim_optimizer)
-                current_local_step_counter = 0
-                for step_info in client_training_trace["steps"]:
-                    for seed, project_grad in step_info.items():
-                        torch.manual_seed(seed)
-                        for n, p in client_optim_parameters_dict[f"client_optim_parameter_{idx}"].items():
-                            if not p.requires_grad: continue
-                            if p.grad is None:
-                                p.grad = torch.normal(mean=0, std=1, size=p.size(), device=p.device, dtype=p.dtype).mul_(project_grad/self.args.zo_sample)
-                            else:
-                                p.grad.add_(torch.normal(mean=0, std=1, size=p.size(), device=p.device, dtype=p.dtype), alpha=project_grad/self.args.zo_sample)
-                    current_local_step_counter += 1
-                    selected_model_params_grad = self.flatten_parameter_gradients(client_optim_parameters_dict[f"client_optim_parameter_{idx}"])
-                    selected_model_params_grad = selected_model_params_grad.float()
-                    self.central_server_checker = self.central_server_checker.float()
-                    selected_model_params_grad = selected_model_params_grad.to("cuda")
-                    self.central_server_checker = self.central_server_checker.to("cuda")
 
-                    dot_product = torch.dot(
-                        selected_model_params_grad.view(-1),
-                        self.central_server_checker.view(-1)
-                    )
-                    dot_product = torch.abs(dot_product).item()
-                    self.dot_product.append({
-                        "current_global_step": current_global_step,
-                        "step": current_local_step_counter,
-                        "dot_product": dot_product
-                    })
-                    print("current client: ", current_client_id)
-                    print("current_local_step_counter: ", current_local_step_counter)
-                    print("dot_product: ", dot_product)
-                    if current_local_step_counter == 100:
-                        filename = f"{self.args.dot_product_path}_gemma_2b_{self.args.task_name}_client{current_client_id}_global_step{current_global_step}.json"
-                        with open(filename, "w") as jsonfile:
-                            json.dump(self.dot_product, jsonfile, indent=4)
-                        print(f"Logs saved to {filename}")
-                    server_monitor_client_optim_optimizer.step()
-                    server_monitor_client_optim_optimizer.zero_grad(set_to_none=True)
-                    server_monitor_client_optim_scheduler.step()
+    def early_stopping_checker(self, clients_innerproduct_list):
+        remaining_clients = {client[0]["current_client_id"]: idx for idx, client in enumerate(clients_innerproduct_list)}
+        max_steps = max(len(client) for client in clients_innerproduct_list)  # Determine maximum number of steps
+        print("max_steps: ", max_steps)
+        # Always keep the first step for all clients
+        truncated_data = [[] for _ in clients_innerproduct_list]
 
-                    with torch.no_grad():
-                        # with self.profiler('optimizer'):
-                        for name, param in client_model_dict[f"client_model_{idx}"].named_parameters():
-                            if not name in client_optim_parameters_dict[f"client_optim_parameter_{idx}"]: continue
-                            param.view(-1)[self.outlier_masks[name]] = client_optim_parameters_dict[f"client_optim_parameter_{idx}"][name]
-                    
-                    client_optim_parameters_dict[f"client_optim_parameter_{idx}"] = {
-                        n : p.view(-1)[self.outlier_masks[n]].detach().clone().requires_grad_(True) for n, p in client_model_dict[f"client_model_{idx}"].named_parameters() if n in self.outlier_masks
-                    }
-                del client_optim_parameters_dict
-                del client_model_dict
-                torch.cuda.empty_cache()
-                gc.collect() 
-            return True        
+        for idx, client in enumerate(clients_innerproduct_list):
+            first_step = [entry for entry in client if entry["step"] == 1]
+            if first_step:
+                truncated_data[idx].extend(first_step)
+
+        for step in range(2, max_steps + 1):  # Start from step 2 (exclude step 1)
+            step_dot_products = []
+
+            # Collect dot products for current step from remaining clients
+            for client_id, idx in remaining_clients.items():
+                client_steps = clients_innerproduct_list[idx]
+                step_data = next((entry for entry in client_steps if entry["step"] == step), None)
+                if step_data:
+                    step_dot_products.append((step_data["dot_product"], client_id))
+            # If no clients have data for this step, move to the next step
+            if not step_dot_products:
+                continue
+
+            # Find the client with the smallest dot product at the current step
+            min_dot_product, min_client_id = min(step_dot_products, key=lambda x: x[0])
+            print("min_client_id: ", min_client_id)
+            # Eliminate the client with the smallest dot product
+            remaining_clients.pop(min_client_id, None)
+
+            # If only one client remains, terminate early
+            if len(remaining_clients) == 1:
+                recorder_step = step
+                for client_id, idx in remaining_clients.items():
+                    while recorder_step <= max_steps:
+                        step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == recorder_step), None)
+                        if step_data:
+                            truncated_data[idx].append(step_data)
+                        if recorder_step == max_steps:
+                            break
+                        recorder_step += 1
+                break
+
+            # Add the current step data to the truncated list for remaining clients
+            for client_id, idx in remaining_clients.items():
+                step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == step), None)
+                if step_data:
+                    truncated_data[idx].append(step_data)
+            print("remaining_clients: ", remaining_clients)
+        return truncated_data
 
 
     def calculate_each_client_innerproduct(self, current_global_step, each_client_project_grad_list, initial_step=0):
@@ -666,6 +657,7 @@ class Server(object):
                 gc.collect() 
             return self.dot_product  
         elif self.args.training_mode == "sparse_dynamic_earlystppping":
+            clients_innerproduct_list = []
             for idx, client_training_trace in enumerate(each_client_project_grad_list):
                 self.dot_product = []
                 current_client_id = client_training_trace["client_id"]
@@ -703,9 +695,9 @@ class Server(object):
                         "dot_product": dot_product,
                         "current_client_id": current_client_id,
                     })
-                    print("current client: ", current_client_id)
-                    print("current_local_step_counter: ", current_local_step_counter)
-                    print("dot_product: ", dot_product)
+                    # print("current client: ", current_client_id)
+                    # print("current_local_step_counter: ", current_local_step_counter)
+                    # print("dot_product: ", dot_product)
                     # if current_local_step_counter == 100:
                     #     filename = f"{self.args.dot_product_path}_gemma_2b_{self.args.task_name}_client{current_client_id}_global_step{current_global_step}.json"
                     #     with open(filename, "w") as jsonfile:
@@ -724,11 +716,12 @@ class Server(object):
                     client_optim_parameters_dict[f"client_optim_parameter_{idx}"] = {
                         n : p.view(-1)[self.outlier_masks[n]].detach().clone().requires_grad_(True) for n, p in client_model_dict[f"client_model_{idx}"].named_parameters() if n in self.outlier_masks
                     }
+                clients_innerproduct_list.append(self.dot_product)
                 del client_optim_parameters_dict
                 del client_model_dict
                 torch.cuda.empty_cache()
                 gc.collect() 
-            return self.dot_product
+            return clients_innerproduct_list
         else:
             for client_data in each_client_project_grad_list:
                 print("client_data: ", client_data)
