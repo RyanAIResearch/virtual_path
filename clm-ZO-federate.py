@@ -597,138 +597,97 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def split_data_balanced_iid_noniid(args, train_data, threshold=5):
-    random.shuffle(train_data)
-    total_users = args.total_num_users
-    total_data_len = len(train_data)
-    target_data_per_client = total_data_len // total_users  # 平均数据量
-    num_classes = 4  # 修改为实际类别数量
-
-    # 将数据按类划分
-    class_samples = {i: [s for s in train_data if s[0]['labels'] == i] for i in range(num_classes)}
-
-    # Non-IID 客户端分配
-    noniid_client_datasets = []
-    for class_idx in range(args.noniid_num_users):
-        noniid_data_count = target_data_per_client + random.randint(-threshold, threshold)
-        noniid_data = class_samples[class_idx][:noniid_data_count]
-        noniid_client_datasets.append(noniid_data)
-        class_samples[class_idx] = class_samples[class_idx][noniid_data_count:]  # 更新剩余样本
-
-    # IID 客户端分配
-    iid_client_datasets = [[] for _ in range(args.iid_num_users)]
-    min_class_data = target_data_per_client // num_classes  # 每类最小数据量
-    for class_idx in range(num_classes):
-        random.shuffle(class_samples[class_idx])  # 打乱类别数据
-        for i in range(args.iid_num_users):
-            allocate_size = min(len(class_samples[class_idx]), min_class_data + random.randint(-threshold, threshold))
-            iid_client_datasets[i].extend(class_samples[class_idx][:allocate_size])
-            class_samples[class_idx] = class_samples[class_idx][allocate_size:]  # 移除已分配样本
-
-    # 补全 IID 客户端数据，确保均衡
-    for i in range(args.iid_num_users):
-        while len(iid_client_datasets[i]) < target_data_per_client - threshold:
-            for class_idx in range(num_classes):
-                if class_samples[class_idx]:
-                    iid_client_datasets[i].append(class_samples[class_idx].pop(0))
-                    if len(iid_client_datasets[i]) >= target_data_per_client - threshold:
-                        break
-
-    # 合并所有客户端数据
-    client_datasets = iid_client_datasets + noniid_client_datasets
-    return client_datasets
-
 def split_data_equal_iid_noniid_2class(args, train_data):
-    if args.task_name == "AGNews":
-        random.shuffle(train_data)
-        total_users = args.total_num_users
-        total_data_len = len(train_data)
-        target_data_per_client = total_data_len // total_users  # 平均数据量
-        num_classes = 4  # 修改为实际类别数量
+    """
+    - 如果 noniid_num_users=0，则所有客户端都走 IID 分配；
+    - 否则，前 iid_num_users 个客户端走 IID，后 noniid_num_users 个客户端走 Non-IID。
+      (适用于二分类场景: num_classes=2)
+    """
 
-        # 将数据按类划分
-        class_samples = {i: [s for s in train_data if s[0]['labels'] == i] for i in range(num_classes)}
+    # 若在指定任务列表里，则执行分配逻辑；否则直接返回所有数据（兜底逻辑）
+    if args.task_name not in ["SST2", "AGNews", "Yelp", "Copa",
+                              "BoolQ", "WIC", "CB", "WSC", "ReCoRD", "RTE"]:
+        return [train_data]  # 不在任务列表时直接返回
 
-        # Non-IID 客户端分配
-        noniid_client_datasets = []
-        for class_idx in range(args.noniid_num_users):
-            noniid_data_count = target_data_per_client + random.randint(-threshold, threshold)
-            noniid_data = class_samples[class_idx][:noniid_data_count]
-            noniid_client_datasets.append(noniid_data)
-            class_samples[class_idx] = class_samples[class_idx][noniid_data_count:]  # 更新剩余样本
+    random.shuffle(train_data)
+    total_data_len = len(train_data)
+    total_users = args.total_num_users
+    assert args.iid_num_users + args.noniid_num_users == total_users, (
+        "iid_num_users + noniid_num_users 必须等于 total_num_users。"
+    )
 
-        # IID 客户端分配
-        iid_client_datasets = [[] for _ in range(args.iid_num_users)]
-        min_class_data = target_data_per_client // num_classes  # 每类最小数据量
-        for class_idx in range(num_classes):
-            random.shuffle(class_samples[class_idx])  # 打乱类别数据
-            for i in range(args.iid_num_users):
-                allocate_size = min(len(class_samples[class_idx]), min_class_data + random.randint(-threshold, threshold))
-                iid_client_datasets[i].extend(class_samples[class_idx][:allocate_size])
-                class_samples[class_idx] = class_samples[class_idx][allocate_size:]  # 移除已分配样本
-
-        # 补全 IID 客户端数据，确保均衡
-        for i in range(args.iid_num_users):
-            while len(iid_client_datasets[i]) < target_data_per_client - threshold:
-                for class_idx in range(num_classes):
-                    if class_samples[class_idx]:
-                        iid_client_datasets[i].append(class_samples[class_idx].pop(0))
-                        if len(iid_client_datasets[i]) >= target_data_per_client - threshold:
-                            break
-
-        # 合并所有客户端数据
-        client_datasets = iid_client_datasets + noniid_client_datasets
+    # ========== 场景 1：noniid_num_users = 0 => 全部走 IID ========== 
+    if args.noniid_num_users == 0:
+        # 直接采用全部 IID 的逻辑：把train_data等分给所有用户
+        num_samples_per_client = total_data_len // total_users
+        client_datasets = []
+        for i in range(total_users):
+            start = i * num_samples_per_client
+            # 最后一个客户端拿剩余全部，避免数据丢失
+            end = start + num_samples_per_client if i < (total_users - 1) else total_data_len
+            client_datasets.append(train_data[start:end])
         return client_datasets
-    else:
-        # 支持多分类任务 (如 2分类、4分类等)
-        assert args.iid_num_users > 0 and args.noniid_num_users > 0
-        assert args.iid_num_users + args.noniid_num_users == args.total_num_users
 
-        total_users = args.total_num_users
-        num_classes = args.num_classes  # 分类数量，如 2 或 4
+    # ========== 场景 2：noniid_num_users > 0 => 前面IID，后面Non-IID ========== 
+    # 先把前 iid_num_users 个客户端分成 IID，每个客户端拿到等量数据切片
+    num_samples_per_client = total_data_len // total_users  # 用于前iid_num_users个 IID
+    client_datasets = []
 
-        random.shuffle(train_data)
-        total_data_len = len(train_data)
+    # -------- 1) 前 iid_num_users 个客户端 (IID 分配) --------
+    for i in range(args.iid_num_users):
+        start = i * num_samples_per_client
+        # 若是最后一个IID客户端，拿到它这部分的全部数据(以避免数据丢失)
+        end = start + num_samples_per_client if i < (args.iid_num_users - 1) else (args.iid_num_users * num_samples_per_client)
+        iid_data = train_data[start:end]
+        client_datasets.append(iid_data)
 
-        # 按类别划分数据
-        class_samples = {i: [s for s in train_data if s[0]['labels'] == i] for i in range(num_classes)}
+    # 剩下的数据 (还没分出去的) 用于后面 noniid_num_users 客户端
+    used_iid_samples = args.iid_num_users * num_samples_per_client
+    leftover_data = train_data[used_iid_samples:]
 
-        # 计算基础配额 s
-        # Non-IID: 每个客户端只需要一个类别的数据，共需 num_classes * s
-        # IID: 每个客户端需要 s 条数据，均匀分配 num_classes 类
-        # 总需求为 (iid_num_users + noniid_num_users / num_classes) * s 条每类数据
-        s = total_data_len // total_users
+    # -------- 2) 后 noniid_num_users 个客户端 (Non-IID 分配) --------
+    num_classes = 2  # 仅示例二分类
+    # 按类别划分 leftover_data
+    class_samples = {
+        c: [sample for sample in leftover_data if sample[0]['labels'] == c]
+        for c in range(num_classes)
+    }
 
-        # 检查每类数据是否足够分配，若不足，降低 s
-        while s > 0:
-            if all(len(class_samples[i]) >= (args.iid_num_users + args.noniid_num_users // num_classes) * s for i in range(num_classes)):
+    leftover_len = len(leftover_data)
+    # 计算每个 Non-IID 客户端可分到多少数据
+    s2 = leftover_len // args.noniid_num_users
+
+    # 检查是否能满足每个 Non-IID 客户端“从单一类别”拿 s2 条数据
+    # 如果不够，就递减 s2
+    while s2 > 0:
+        can_distribute = True
+        # 只要保证每个类别都 >= s2 * (需要分配的客户端数 / num_classes)，
+        # 这里为了简化，先假定每个非IID客户端只从它对应class_idx拿s2。
+        # 只要 class_samples[0] 和 class_samples[1] 都 >= s2，就可分
+        for c in range(num_classes):
+            if len(class_samples[c]) < s2:
+                can_distribute = False
                 break
-            s -= 1
+        if can_distribute:
+            break
+        s2 -= 1
 
-        if s == 0:
-            raise ValueError("无法满足要求：数据不足以平均分配并满足 Non-IID 与 IID 比例要求。")
+    if s2 == 0:
+        raise ValueError("无法满足 Non-IID 分配：剩余数据不足以给这几个客户端分配。")
 
-        # 分配 Non-IID 数据
-        noniid_client_datasets = []
-        for i in range(args.noniid_num_users):
-            # 每个 Non-IID 客户端从单一类别中获取 s 条数据
-            class_idx = i % num_classes  # 轮流从每个类别分配
-            random.shuffle(class_samples[class_idx])
-            noniid_client_datasets.append(class_samples[class_idx][:s])
-            class_samples[class_idx] = class_samples[class_idx][s:]  # 移除已分配的数据
+    # 按照原先的Non-IID逻辑：client i 只拿一个类别的数据
+    # class_idx = i % num_classes
+    for i in range(args.noniid_num_users):
+        class_idx = i % num_classes
+        random.shuffle(class_samples[class_idx])
+        noniid_data = class_samples[class_idx][:s2]
+        # 从后面取非IID数据
+        client_datasets.append(noniid_data)
+        # 移除已经分配的这块数据
+        class_samples[class_idx] = class_samples[class_idx][s2:]
 
-        # 分配 IID 数据
-        iid_client_datasets = [[] for _ in range(args.iid_num_users)]
-        for i in range(args.iid_num_users):
-            # 每个 IID 客户端需要从每类分配 s // num_classes 条数据
-            for c in range(num_classes):
-                class_chunk = class_samples[c][i * (s // num_classes):(i + 1) * (s // num_classes)]
-                iid_client_datasets[i].extend(class_chunk)
-
-        # 合并 IID 和 Non-IID 数据
-        client_datasets = iid_client_datasets + noniid_client_datasets
-        return client_datasets
-
+    # 最终返回前(iid_num_users) + 后(noniid_num_users)个客户端数据
+    return client_datasets
 
 def split_data(args, train_data):
     # iid or non-iid
@@ -1116,7 +1075,7 @@ def main(args):
     if args.task_name in ["SST2", "AGNews", "Yelp", "Copa","BoolQ","WIC","CB","WSC","ReCoRD","RTE","YelpReview"]:
 
         if args.training_mode == "sparse_dynamic_localstep" or args.training_mode == "sparse_dynamic_multiclients" or args.training_mode == "sparse_dynamic_earlystppping":
-            client_data_lists = split_data_balanced_iid_noniid(args, train_dataset.__get__())
+            client_data_lists = split_data_equal_iid_noniid_2class(args, train_dataset.__get__())
         else:
             client_data_lists = split_data(args, train_dataset.__get__())
 

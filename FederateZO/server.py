@@ -282,7 +282,7 @@ class Server(object):
                 project_grad_accelerator = {}
                 # fill the dict
                 print("calculate each client inner product with c4 grad")
-                self.calculate_each_client_innerproduct(step, grad_accumulator)
+                # self.calculate_each_client_innerproduct(step, grad_accumulator)
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 client_optim_parameters_dict = {}
                 client_model_dict = {}
@@ -536,57 +536,121 @@ class Server(object):
             ctx_manager = contextlib.nullcontext()
 
         return ctx_manager
-
+    
     def early_stopping_checker(self, clients_innerproduct_list):
-        remaining_clients = {client[0]["current_client_id"]: idx for idx, client in enumerate(clients_innerproduct_list)}
-        max_steps = max(len(client) for client in clients_innerproduct_list)  # Determine maximum number of steps
-        print("max_steps: ", max_steps)
-        # Always keep the first step for all clients
+        # 1) 初始化：remaining_clients 用字典表示，key=client_id, value=在 clients_innerproduct_list 里的索引 idx
+        import ipdb
+        print("clients_innerproduct_list: ", clients_innerproduct_list)
+        remaining_clients = {
+            client_list[0]["current_client_id"]: idx
+            for idx, client_list in enumerate(clients_innerproduct_list)
+            if len(client_list) > 0
+        }
+        print("remaining_clients:", remaining_clients)
+
+        # 本地最多训练步数
+        max_steps = self.args.local_train_steps
+        print("max_steps:", max_steps)
+
+        # 准备一个二维列表，存最终要保留的各客户端的所有 step 数据
+        #   truncated_data[i] 对应 clients_innerproduct_list[i]
         truncated_data = [[] for _ in clients_innerproduct_list]
 
-        for idx, client in enumerate(clients_innerproduct_list):
-            first_step = [entry for entry in client if entry["step"] == 1]
-            if first_step:
-                truncated_data[idx].extend(first_step)
+        # 用来保存各客户端的绝对改变量序列，形如：
+        #   absolute_changes[client_id] = [abs_change_step2, abs_change_step3, ...]
+        absolute_changes = {
+            client_id: []
+            for client_id in remaining_clients.keys()
+        }
 
-        for step in range(2, max_steps + 1):  # Start from step 2 (exclude step 1)
+        # 2) 先把所有客户端 step=1 的那条数据拿出来放进 truncated_data
+        for client_id, idx in remaining_clients.items():
+            first_step_data = next(
+                (entry for entry in clients_innerproduct_list[idx] if entry["step"] == 1),
+                None
+            )
+            if first_step_data:
+                truncated_data[idx].append(first_step_data)
+
+        # 3) 从第 2 步遍历到 max_steps
+        for step in range(2, max_steps + 1):
+            # 用来临时记录当前 step 哪些客户端有数据
             step_dot_products = []
 
-            # Collect dot products for current step from remaining clients
+            # (1) 先收集所有剩余客户端在本 step 的 dot_product 并计算绝对改变量
             for client_id, idx in remaining_clients.items():
+                # 拿到该客户端的所有 step 数据
                 client_steps = clients_innerproduct_list[idx]
-                step_data = next((entry for entry in client_steps if entry["step"] == step), None)
-                if step_data:
-                    step_dot_products.append((step_data["dot_product"], client_id))
-            # If no clients have data for this step, move to the next step
+                # 找到当前 step 的数据
+                step_data = next(
+                    (entry for entry in client_steps if entry["step"] == step),
+                    None
+                )
+                if step_data is not None:
+                    step_dot_products.append((client_id, step_data["dot_product"]))
+
+                    # 计算本 step 的绝对改变量：
+                    #   = |dot_product(step) - 上一次保留的 dot_product|
+                    prev_dot_product = truncated_data[idx][-1]["dot_product"]
+                    abs_change = abs(step_data["dot_product"] - prev_dot_product)
+                    absolute_changes[client_id].append(abs_change)
+
+            # 如果所有剩余的客户端都没有当前 step 的数据，则直接跳到下一个 step
             if not step_dot_products:
                 continue
 
-            # Find the client with the smallest dot product at the current step
-            min_dot_product, min_client_id = min(step_dot_products, key=lambda x: x[0])
-            print("min_client_id: ", min_client_id)
-            # Eliminate the client with the smallest dot product
-            remaining_clients.pop(min_client_id, None)
+            # (2) 根据当前 absolute_changes 找出「平均绝对改变量」最大的客户端
+            client_to_remove = None
+            max_mean_change = -float("inf")
 
-            # If only one client remains, terminate early
+            for client_id in remaining_clients.keys():
+                changes = absolute_changes[client_id]
+                if len(changes) > 0:
+                    mean_abs_change = sum(changes) / len(changes)
+                    # 取最大的均值
+                    if mean_abs_change > max_mean_change:
+                        max_mean_change = mean_abs_change
+                        client_to_remove = client_id
+
+            # (3) 将这个「最大平均改变量」的客户端淘汰
+            if client_to_remove is not None:
+                idx_to_remove = remaining_clients[client_to_remove]
+                print(f"Removing client with max mean absolute change: client_id={client_to_remove}, idx={idx_to_remove}")
+                remaining_clients.pop(client_to_remove, None)
+
+            # (4) 如果只剩下一个客户端，直接把它后续所有 step 的数据保留然后结束
             if len(remaining_clients) == 1:
+                # 比如 step=4 时只剩一个客户端，那就把这个客户端从 step=4 到 step=max_steps 的所有数据补齐
                 recorder_step = step
-                for client_id, idx in remaining_clients.items():
+                # 只剩下一个客户端
+                for last_client_id, last_idx in remaining_clients.items():
                     while recorder_step <= max_steps:
-                        step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == recorder_step), None)
+                        step_data = next(
+                            (entry for entry in clients_innerproduct_list[last_idx] if entry["step"] == recorder_step),
+                            None
+                        )
                         if step_data:
-                            truncated_data[idx].append(step_data)
-                        if recorder_step == max_steps:
-                            break
+                            truncated_data[last_idx].append(step_data)
                         recorder_step += 1
+                # 最后 break 跳出大循环
                 break
 
-            # Add the current step data to the truncated list for remaining clients
+            # (5) 如果还剩多个客户端，就把本 step 的数据也存到 truncated_data
+            #     (对那些在本 step 有数据的客户端才进行追加)
             for client_id, idx in remaining_clients.items():
-                step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == step), None)
-                if step_data:
+                step_data = next(
+                    (entry for entry in clients_innerproduct_list[idx] if entry["step"] == step),
+                    None
+                )
+                if step_data is not None:
                     truncated_data[idx].append(step_data)
-            print("remaining_clients: ", remaining_clients)
+
+            # 输出当前还剩哪些客户端
+            print("remaining_clients:", remaining_clients)
+
+        print("truncated_data:", truncated_data)
+        ipdb.set_trace()
+        # 如需调试，可在此处设置断点
         return truncated_data
     
     def selected_path(self, grad_accumulator, optimized_virtual_path):
@@ -1174,3 +1238,57 @@ class Server(object):
                 # del grad_accumulator
                 # gc.collect()
                 # return self.global_model, self.named_parameters_to_optim
+
+
+
+    # def early_stopping_checker(self, clients_innerproduct_list):
+    #     remaining_clients = {client[0]["current_client_id"]: idx for idx, client in enumerate(clients_innerproduct_list)}
+    #     max_steps = max(len(client) for client in clients_innerproduct_list)  # Determine maximum number of steps
+    #     print("max_steps: ", max_steps)
+    #     # Always keep the first step for all clients
+    #     truncated_data = [[] for _ in clients_innerproduct_list]
+
+    #     for idx, client in enumerate(clients_innerproduct_list):
+    #         first_step = [entry for entry in client if entry["step"] == 1]
+    #         if first_step:
+    #             truncated_data[idx].extend(first_step)
+
+    #     for step in range(2, max_steps + 1):  # Start from step 2 (exclude step 1)
+    #         step_dot_products = []
+
+    #         # Collect dot products for current step from remaining clients
+    #         for client_id, idx in remaining_clients.items():
+    #             client_steps = clients_innerproduct_list[idx]
+    #             step_data = next((entry for entry in client_steps if entry["step"] == step), None)
+    #             if step_data:
+    #                 step_dot_products.append((step_data["dot_product"], client_id))
+    #         # If no clients have data for this step, move to the next step
+    #         if not step_dot_products:
+    #             continue
+
+    #         # Find the client with the smallest dot product at the current step
+    #         min_dot_product, min_client_id = min(step_dot_products, key=lambda x: x[0])
+    #         print("min_client_id: ", min_client_id)
+    #         # Eliminate the client with the smallest dot product
+    #         remaining_clients.pop(min_client_id, None)
+
+    #         # If only one client remains, terminate early
+    #         if len(remaining_clients) == 1:
+    #             recorder_step = step
+    #             for client_id, idx in remaining_clients.items():
+    #                 while recorder_step <= max_steps:
+    #                     step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == recorder_step), None)
+    #                     if step_data:
+    #                         truncated_data[idx].append(step_data)
+    #                     if recorder_step == max_steps:
+    #                         break
+    #                     recorder_step += 1
+    #             break
+
+    #         # Add the current step data to the truncated list for remaining clients
+    #         for client_id, idx in remaining_clients.items():
+    #             step_data = next((entry for entry in clients_innerproduct_list[idx] if entry["step"] == step), None)
+    #             if step_data:
+    #                 truncated_data[idx].append(step_data)
+    #         print("remaining_clients: ", remaining_clients)
+    #     return truncated_data
